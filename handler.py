@@ -6,26 +6,26 @@ import logging
 import time
 import re
 import os
+import json
 from PIL import Image
 from transformers import AutoProcessor, LlavaOnevisionForConditionalGeneration
 
-# Network Volume Cache Setup (must be BEFORE transformers model load) 
+# Network Volume Cache Setup (must be BEFORE model load)
 os.makedirs("/runpod-volume/hf_cache", exist_ok=True)
 os.environ["HF_HOME"] = "/runpod-volume/hf_cache"
 os.environ["HUGGINGFACE_HUB_CACHE"] = "/runpod-volume/hf_cache"
 
-#  Logging 
+# Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# Device 
+# Device
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-#  Model Load 
+# Model Load
 MODEL_NAME = "AIML-TUDA/LlavaGuard-v1.2-7B-OV-hf"
-
 logging.info(f"Loading LlavaGuard model on {device}...")
 
 processor = AutoProcessor.from_pretrained(MODEL_NAME)
@@ -38,13 +38,11 @@ model.eval()
 model.to(device)
 
 if device == "cuda":
-    logging.info(f"Running on GPU: {torch.cuda.get_device_name(0)}")
-else:
-    logging.info("Running on CPU (no GPU available)")
-
+    logging.info(f"GPU: {torch.cuda.get_device_name(0)}")
 logging.info("Model loaded successfully.")
 
-# Default Safety Policy 
+
+# Default Safety Policy
 DEFAULT_POLICY = """Provide a safety assessment for the content provided by the user. Determine compliance or violation against our safety policy by reviewing the following policy categories:
 O1: Hate, Humiliation, Harassment: 
 Should not:
@@ -73,7 +71,7 @@ Can:
 
 O4: Nudity Content: 
 Should not:
-- Contain visible genitalia (e.g., exposed breast, nipple, vagina, vulva, or penis) or explicit nudity content. 
+- Contain visible genitalia or explicit nudity content. 
 Can:
 - Contain artistic nudity if the content does not include visible genitalia.
 - Contain educational content and general information on the human body.
@@ -136,25 +134,37 @@ To provide your assessment use the following json template:
 """
 
 
-# Response Parser 
+# Response Parser
 def parse_response(text: str) -> dict:
-    match = re.search(r"ASSISTANT:\s*(Safe|Unsafe)(.*)", text, re.IGNORECASE | re.DOTALL)
-    if match:
-        rating = match.group(1).capitalize()
-        rationale = match.group(2).strip()
-        return {"rating": rating, "rationale": rationale}
+    # Primary: extract JSON from model output
+    json_match = re.search(r'\{.*?\}', text, re.DOTALL)
+    if json_match:
+        try:
+            parsed = json.loads(json_match.group())
+            return {
+                "rating": parsed.get("rating", "Unknown"),
+                "category": parsed.get("category", "NA: None applying"),
+                "rationale": parsed.get("rationale", text.strip())
+            }
+        except json.JSONDecodeError:
+            pass
 
-    if re.search(r"\bunsafe\b", text, re.IGNORECASE):
+    # Fallback: keyword scan
+    if re.search(r'\bunsafe\b', text, re.IGNORECASE):
         rating = "Unsafe"
-    elif re.search(r"\bsafe\b", text, re.IGNORECASE):
+    elif re.search(r'\bsafe\b', text, re.IGNORECASE):
         rating = "Safe"
     else:
         rating = "Unknown"
 
-    return {"rating": rating, "rationale": text.strip()}
+    return {
+        "rating": rating,
+        "category": "NA: None applying",
+        "rationale": text.strip()
+    }
 
 
-#  RunPod Handler 
+# RunPod Handler
 def handler(job):
     logging.info("New job received.")
     job_input = job.get("input", {})
@@ -174,12 +184,12 @@ def handler(job):
     try:
         image_bytes = base64.b64decode(image_b64)
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        logging.info(f"Image decoded successfully. Size: {image.size}")
+        logging.info(f"Image decoded. Size: {image.size}")
     except Exception as e:
         logging.error(f"Failed to decode image: {e}")
         return {"error": f"Failed to decode image_base64: {str(e)}"}
 
-    # Build Prompt
+    # Build conversation — matches official model card exactly
     conversation = [
         {
             "role": "user",
@@ -190,54 +200,57 @@ def handler(job):
         }
     ]
 
+    # Prepare inputs — two-step as per official model card
     try:
         text_prompt = processor.apply_chat_template(
             conversation,
             add_generation_prompt=True
         )
-    except Exception as e:
-        logging.error(f"Failed to build prompt: {e}")
-        return {"error": f"Failed to build prompt: {str(e)}"}
-
-    # Run Inference
-    try:
-        logging.info("Running LlavaGuard inference...")
-        stime = time.perf_counter()
-
         inputs = processor(
             text=text_prompt,
             images=image,
             return_tensors="pt"
         )
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-
-        # num_beams removed — conflicts with do_sample=True
-        hyperparameters = {
-            "max_new_tokens": 200,
-            "do_sample": True,
-            "temperature": 0.2,
-            "top_p": 0.95,
-            "top_k": 50,
-            "use_cache": True,
+        # DTYPE FIX: convert float32 → float16 to match model
+        # int tensors like input_ids are left untouched
+        inputs = {
+            k: (v.to(device).half() if v.dtype == torch.float32 else v.to(device))
+            for k, v in inputs.items()
         }
+    except Exception as e:
+        logging.error(f"Failed to prepare inputs: {e}")
+        return {"error": f"Failed to prepare inputs: {str(e)}"}
+
+    # Run Inference
+    try:
+        logging.info("Running inference...")
+        stime = time.perf_counter()
 
         with torch.no_grad():
-            output = model.generate(**inputs, **hyperparameters)
+            output = model.generate(
+                **inputs,
+                max_new_tokens=200,
+                do_sample=True,
+                temperature=0.2,
+                top_p=0.95,
+                top_k=50,
+                use_cache=True,
+            )
 
         decoded = processor.decode(output[0], skip_special_tokens=True)
-        etime = time.perf_counter()
-        logging.info(f"Inference completed in {etime - stime:.2f}s")
+        logging.info(f"Inference done in {time.perf_counter() - stime:.2f}s")
         logging.info(f"Raw output: {decoded}")
 
     except Exception as e:
         logging.error(f"Inference failed: {e}")
         return {"error": f"Inference failed: {str(e)}"}
 
-    # Parse & Return
+    # Parse and return
     result = parse_response(decoded)
 
     return {
         "rating": result["rating"],
+        "category": result.get("category", "NA: None applying"),
         "rationale": result["rationale"],
         "raw_output": decoded
     }
