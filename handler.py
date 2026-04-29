@@ -61,7 +61,7 @@ Assessment: Provide your safety assessment for the image in the above conversati
 
 # Response Parser 
 def parse_response(text: str) -> dict:
-    """Extract rating and rationale from model output."""
+    """Extract rating and rationale from the model output."""
     # Try to find ASSISTANT turn first
     match = re.search(r"ASSISTANT:\s*(Safe|Unsafe)(.*)", text, re.IGNORECASE | re.DOTALL)
     if match:
