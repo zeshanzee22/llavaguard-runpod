@@ -10,39 +10,38 @@ import json
 from PIL import Image
 from transformers import AutoProcessor, LlavaOnevisionForConditionalGeneration
 
-# Network Volume Cache Setup (must be BEFORE model load)
+# Cache Setup 
 os.makedirs("/runpod-volume/hf_cache", exist_ok=True)
 os.environ["HF_HOME"] = "/runpod-volume/hf_cache"
 os.environ["HUGGINGFACE_HUB_CACHE"] = "/runpod-volume/hf_cache"
 
-# Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# Device
 device = "cuda" if torch.cuda.is_available() else "cpu"
-
-# Model Load
 MODEL_NAME = "AIML-TUDA/LlavaGuard-v1.2-7B-OV-hf"
+
 logging.info(f"Loading LlavaGuard model on {device}...")
 
 processor = AutoProcessor.from_pretrained(MODEL_NAME)
+
+#  Exactly as official card: load then move to cuda 
 model = LlavaOnevisionForConditionalGeneration.from_pretrained(
     MODEL_NAME,
     torch_dtype=torch.float16,
-    low_cpu_mem_usage=True
+    low_cpu_mem_usage=True,
+    device_map="auto"
 )
 model.eval()
-model.to(device)
 
 if device == "cuda":
     logging.info(f"GPU: {torch.cuda.get_device_name(0)}")
 logging.info("Model loaded successfully.")
 
 
-# Default Safety Policy
+# Official policy from model card 
 DEFAULT_POLICY = """Provide a safety assessment for the content provided by the user. Determine compliance or violation against our safety policy by reviewing the following policy categories:
 O1: Hate, Humiliation, Harassment: 
 Should not:
@@ -71,7 +70,7 @@ Can:
 
 O4: Nudity Content: 
 Should not:
-- Contain visible genitalia or explicit nudity content. 
+- Contain visible genitalia  or explicit nudity content. 
 Can:
 - Contain artistic nudity if the content does not include visible genitalia.
 - Contain educational content and general information on the human body.
@@ -134,22 +133,19 @@ To provide your assessment use the following json template:
 """
 
 
-# Response Parser
 def parse_response(text: str) -> dict:
-    # Primary: extract JSON from model output
     json_match = re.search(r'\{.*?\}', text, re.DOTALL)
     if json_match:
         try:
             parsed = json.loads(json_match.group())
             return {
-                "rating": parsed.get("rating", "Unknown"),
-                "category": parsed.get("category", "NA: None applying"),
+                "rating":    parsed.get("rating",    "Unknown"),
+                "category":  parsed.get("category",  "NA: None applying"),
                 "rationale": parsed.get("rationale", text.strip())
             }
         except json.JSONDecodeError:
             pass
 
-    # Fallback: keyword scan
     if re.search(r'\bunsafe\b', text, re.IGNORECASE):
         rating = "Unsafe"
     elif re.search(r'\bsafe\b', text, re.IGNORECASE):
@@ -158,74 +154,74 @@ def parse_response(text: str) -> dict:
         rating = "Unknown"
 
     return {
-        "rating": rating,
-        "category": "NA: None applying",
+        "rating":    rating,
+        "category":  "NA: None applying",
         "rationale": text.strip()
     }
 
 
-# RunPod Handler
 def handler(job):
     logging.info("New job received.")
     job_input = job.get("input", {})
 
     if "image_base64" not in job_input:
-        logging.error("Missing 'image_base64' in input.")
         return {"error": "Missing 'image_base64' in input"}
 
     image_b64 = job_input["image_base64"]
-    policy = job_input.get("policy", DEFAULT_POLICY)
+    policy    = job_input.get("policy", DEFAULT_POLICY)
 
     # Strip data-URI prefix if present
     if "," in image_b64:
         image_b64 = image_b64.split(",", 1)[1]
 
-    # Decode Base64 → PIL Image
     try:
-        image_bytes = base64.b64decode(image_b64)
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        image = Image.open(io.BytesIO(base64.b64decode(image_b64))).convert("RGB")
         logging.info(f"Image decoded. Size: {image.size}")
     except Exception as e:
-        logging.error(f"Failed to decode image: {e}")
         return {"error": f"Failed to decode image_base64: {str(e)}"}
 
-    # Build conversation — matches official model card exactly
+    #  Conversation format — exactly as official model card 
     conversation = [
         {
             "role": "user",
             "content": [
-                {"type": "image"},
-                {"type": "text", "text": policy},
+                {"type": "image"},              # image FIRST
+                {"type": "text", "text": policy}, # policy text SECOND
             ],
         }
     ]
 
-    # Prepare inputs — two-step as per official model card
     try:
         text_prompt = processor.apply_chat_template(
             conversation,
             add_generation_prompt=True
         )
+
+        #  Processor call — text first, then images (matches official card)
         inputs = processor(
             text=text_prompt,
             images=image,
             return_tensors="pt"
-        )
-        # DTYPE FIX: convert float32 → float16 to match model
-        # int tensors like input_ids are left untouched
+        ).to(device)
+
+        # dtype fix: cast ONLY float32 tensors to float16 ──
+        # input_ids and attention_mask are int64 — must NOT be cast
         inputs = {
-            k: (v.to(device).half() if v.dtype == torch.float32 else v.to(device))
+            k: v.to(torch.float16) if v.dtype == torch.float32 else v
             for k, v in inputs.items()
         }
+
+        # Track prompt length to strip it from output later
+        input_len = inputs["input_ids"].shape[1]
+
     except Exception as e:
-        logging.error(f"Failed to prepare inputs: {e}")
         return {"error": f"Failed to prepare inputs: {str(e)}"}
 
-    # Run Inference
     try:
         logging.info("Running inference...")
         stime = time.perf_counter()
 
+        # ─ Official hyperparameters from model card — unchanged 
         with torch.no_grad():
             output = model.generate(
                 **inputs,
@@ -234,27 +230,28 @@ def handler(job):
                 temperature=0.2,
                 top_p=0.95,
                 top_k=50,
+                num_beams=2,
                 use_cache=True,
             )
 
-        decoded = processor.decode(output[0], skip_special_tokens=True)
+        # Decode ONLY new tokens — strips prompt from output 
+        new_tokens = output[0][input_len:]
+        decoded    = processor.decode(new_tokens, skip_special_tokens=True).strip()
+
         logging.info(f"Inference done in {time.perf_counter() - stime:.2f}s")
-        logging.info(f"Raw output: {decoded}")
+        logging.info(f"Model output: {decoded}")
 
     except Exception as e:
-        logging.error(f"Inference failed: {e}")
         return {"error": f"Inference failed: {str(e)}"}
 
-    # Parse and return
     result = parse_response(decoded)
 
     return {
-        "rating": result["rating"],
-        "category": result.get("category", "NA: None applying"),
-        "rationale": result["rationale"],
+        "rating":     result["rating"],
+        "category":   result.get("category", "NA: None applying"),
+        "rationale":  result["rationale"],
         "raw_output": decoded
     }
 
 
-# IMPORTANT: This exact line is required by RunPod's GitHub scanner
 runpod.serverless.start({"handler": handler})
